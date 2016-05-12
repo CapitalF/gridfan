@@ -1,0 +1,552 @@
+#!/bin/bash
+#
+# gridfan: A simple controller script for the NZXT Grid+ V2 fan controller.
+
+VERSION=1.0
+MYNAME=$(basename $0)
+GRID_DEV=/dev/GridPlus0 # Default device file if not set with -d.
+
+#--
+
+echoerr() {
+	# Print errors to stderr.
+	echo "$@" 1>&2;
+	if [[ -n "$SEEN_ERROR" ]] ; then declare -r SEEN_ERROR=1 ; fi # If we saw any errors, set SEEN_ERROR=1, for later use.
+}
+
+echodebug() {
+	# Print debug messages to stderr if debugging enabled.
+	if [[ "$SCRIPT_DEBUG" == 1 ]] ; then
+		echo "$@" 1>&2;
+	fi
+}
+
+f_printusage() {
+	# Print helpful usage info.
+	echoerr ""
+	echoerr "Usage: "
+	echoerr ""
+	echoerr "  -D|--debug                   Debug the $MYNAME script."
+	echoerr "  -d|--device                  Specify the Grid+ Device (Default is $GRID_DEV)."
+	echoerr "  help|--help|-h|-H            Show help info."
+	echoerr ""
+	echoerr "  init|sync                    Initialize the controller with the PC."
+	echoerr "  ping|hello                   Ping/query the Grid+ device to see if it's alive."
+	echoerr "  show|get                     Get status of some attribute (See subcommands.)"
+	echoerr "    show fan|fans              Show status/info of one or more fans. Requires a fan ID (1-6 or \"all\")."
+	echoerr "    show all|everything        Show all status/info available."
+	echoerr "  set                          Set some attribute (See subcommands.)"
+	echoerr "    set fan x speed y          Set a fan of ID x to speed y as a percent: 0%, 20%-100% in 5% increments."
+	echoerr ""
+	echoerr "Examples:"
+	echoerr ""
+	echoerr "  $MYNAME show all                     Show everything."
+	echoerr "  $MYNAME show fans 3 5 1              Print information for fans 3, 5, and 1."
+	echoerr "  $MYNAME set fans all speed 40        Set the speed of all fans to 40% (This is the default on boot)"
+	echoerr "  $MYNAME set fans 4 6 speed 0         Turn off fans 4 and 6."
+	echoerr "  $MYNAME set fans 4 6 speed off       Same thing as above."
+	echoerr ""
+}
+
+f_help () {
+	# Show some helpful information.
+	echoerr ""
+	echoerr "$MYNAME is a simple control script for the NZXT Grid+ v2 fan controller."
+	echoerr ""
+	echoerr "  $MYNAME version: $VERSION"
+	f_printusage
+	return 0
+}
+
+f_validate_dev() {
+	# Try to validate that the device is actually a Grid controller.
+	#
+	# FIXME: Check the USB info to see if it matches.
+	#
+	# Is the device file readable?
+	if [[ ! -r "$GRID_DEV" ]] ; then
+		echoerr "ERROR: Device \"$GRID_DEV\" not readable."
+		return 2
+	fi
+	# Is the device file writable?
+	if [[ ! -w "$GRID_DEV" ]] ; then
+		echoerr "ERROR: Device \"$GRID_DEV\" not writable."
+		return 2
+	fi
+	return 0
+}
+
+f_setup_dev() {
+	# Set up the tty device with stty.
+	if [[ "$SEEN_SETUP_STTY" == 1 ]] ; then # We've already been here once, no need to do it again.
+		# FIXME: This never happens because of capturing stdout on $(f_sendhex), which happens in a subshell.
+		echodebug "DEBUG: ${FUNCNAME[0]}: Already set up stty parameters. Not doing it again."
+		return 0
+	fi
+	STTY_PARAMS="9600 raw -echo -echoe -echok"
+	echodebug "DEBUG: ${FUNCNAME[0]}: stty setting parameters to the device: \"$STTY_PARAMS\"."
+	stty -F $GRID_DEV $STTY_PARAMS &> /dev/null ; X_STTY=$?
+	SEEN_SETUP_STTY=1
+	if [[ ! "$X_STTY" == 0 ]] ; then
+		echoerr "ERROR: stty returned code $X_STTY. Unable to set up the serial device file."
+		return 1
+	fi
+}
+
+f_sendhex_validate_in_bytes() {
+	# Validate our input bytes when sending a command to the controller.
+	if [[ "$IN_NUM_BYTES" -ne "$IN_VALID_BYTES" ]] ; then
+		echoerr "ERROR: Number of input bytes ($IN_NUM_BYTES) for command \"$CMD_BYTE\" invalid; must be $IN_VALID_BYTES."
+		return 2
+	fi
+}
+
+f_xmit() {
+	# Take our IN_BYTES, convert it to a bash/echo-able string, and send it.
+	for EACH in $@ ; do
+		XMIT_CMD="${XMIT_CMD}\\x$EACH"
+	done ; unset EACH
+	f_validate_dev || return $?
+	f_setup_dev || return $?
+	#
+	# FIXME: If there is old data in the buffer, we need to flush it first. This is non-ideal but apparently works.
+	echodebug "DEBUG: ${FUNCNAME[0]}: Flushing device output before transmission."
+	while read -t 0 FLUSH < $GRID_DEV ; do continue ; done &> /dev/null ; X_FLUSH_DEV=$? ; unset FLUSH ; true
+	#
+	echodebug "DEBUG: ${FUNCNAME[0]}: Sending XMIT_CMD \"$XMIT_CMD\" to GRID_DEV \"$GRID_DEV\"."
+	echo -ne "$XMIT_CMD" > $GRID_DEV 2>/dev/null ; X_XMIT=$?
+	# FIXME: Can we lock the device?
+	return $X_XMIT
+}
+
+f_receive() {
+	# Gather data from the controller serial port.
+	#
+	hexdump -n $OUT_VALID_BYTES -v -e '/1 "%02X "' < $GRID_DEV | tr [:lower:] [:upper:] | egrep -o "([0-9A-F]{2} )*[0-9A-F]{2}" & PID_HEXDUMP=$!
+	# Start hexdump above in the background, then wait for a reply.
+	declare -i WAIT_COUNT=0
+	X_RECEIVE=0 # FIXME: Lazy.
+	while ( kill -s 0 $PID_HEXDUMP &> /dev/null ) ; do # Check if the process still exists (is waiting).
+		WAIT_COUNT=$(( $WAIT_COUNT + 1 ))
+		echodebug "DEBUG: ${FUNCNAME[0]}: Waiting for hexdump pipeline to finish. \"PID=$PID_HEXDUMP\", \"WAIT_COUNT=$WAIT_COUNT\"."
+		if [[ "$WAIT_COUNT" -ge 100 ]] ; then # This number multiplied by the sleep is how long we wait.
+			echodebug "DEBUG: ${FUNCNAME[0]}: Killing hexdump pipeline due to timeout."
+			kill -s TERM $PID_HEXDUMP &> /dev/null
+			echodebug "DEBUG: ${FUNCNAME[0]}: hexdump pipeline killed."
+			X_RECEIVE=9
+			break
+		fi
+		sleep 0.01
+	done ; unset WAIT_COUNT
+	#
+	# I dobut that tr is needed, but whatever.
+	# The grep will eliminate trailing spaces, and anything else invalid.
+	#
+	# hexdump -n $OUT_VALID_BYTES -v -e '/1 "%02X "' < $GRID_DEV | tr [:lower:] [:upper:] | egrep -o "([0-9A-F]{2} )*[0-9A-F]{2}" ; X_RECEIVE=0
+	#
+	return $X_RECEIVE
+}
+
+f_sendhex() {
+	# Send some hex to the serial device and write the hex response to stdout.
+	# Input format must be space-seperated nibble-pairs; "00 01 02 03". Output is the same format.
+	#
+	unset OUT_BYTES IN_BYTES OUT_NUM_BYTES IN_NUM_BYTES IN_VALID_BYTES OUT_VALID_BYTES CMD_BYTE
+	#
+	IN_BYTES=$@
+	IN_BYTES=$(echo "$IN_BYTES" | tr [:lower:] [:upper:]) # Change case of input to upper.
+	IN_NUM_BYTES=$#
+	CMD_BYTE=$(echo "$IN_BYTES" | cut -f 1 -d ' ')
+	echodebug "DEBUG: ${FUNCNAME[0]}: input \"IN_BYTES=$IN_BYTES\", \"IN_NUM_BYTES=$IN_NUM_BYTES\"."
+	#
+	if [[ "$IN_BYTES" == 0 ]] ; then
+		echoerr ""
+		echoerr "ERROR: ${FUNCNAME[0]} had no input."
+		echoerr ""
+		return 2
+	fi
+	#
+	# Validate format of input; dual-nibble byte words, space separated, and nothing else.
+	for EACH in $IN_BYTES ; do
+		( echo "$EACH" | egrep "[0-9A-F]{2}" &> /dev/null ) || { 
+			echoerr ""
+			echoerr "ERROR: ${FUNCNAME[0]} byte \"$EACH\" in command \"$IN_BYTES\" is invalid."
+			echoerr ""
+			return 2 ; }
+	done ; unset EACH 
+	#
+	# Grid controller output is dependant upon the input, and there is no delimitation, so we must assume the output byte size.
+	# This is where we define our input command bytes.
+	case "$CMD_BYTE" in
+		'C0') # Controller check/hello.
+			IN_VALID_BYTES=1
+			OUT_VALID_BYTES=1
+		;;
+		'44') # Set the speed of a fan.
+			IN_VALID_BYTES=7
+			OUT_VALID_BYTES=1
+		;;
+		'84') # UNKNOWN COMMAND.
+			IN_VALID_BYTES=2
+			OUT_VALID_BYTES=5
+		;;
+		'85') # UNKNOWN COMMAND.
+			IN_VALID_BYTES=2
+			OUT_VALID_BYTES=5
+		;;
+		'8A') # Get the speed of a fan.
+			IN_VALID_BYTES=2
+			OUT_VALID_BYTES=5
+		;;
+		*) # Unknown.
+			echoerr ""
+			echoerr "ERROR: ${FUNCNAME[0]} command byte \"$CMD_BYTE\" is invalid."
+			echoerr ""
+			return 2
+		;;
+		
+	esac
+	#
+	# Validate our input bytes based on the command type.
+	f_sendhex_validate_in_bytes || return 2
+	#
+	# Finally, we transmit the command to the serial port and get the reply.
+	f_xmit "$IN_BYTES" || return 7
+	OUT_BYTES=$(f_receive) ; X_RECEIVE=$?
+	OUT_NUM_BYTES=$(echo "$OUT_BYTES" | wc -w)
+	echodebug "DEBUG: ${FUNCNAME[0]}: f_receive exit code \"$X_RECEIVE\"."
+	echodebug "DEBUG: ${FUNCNAME[0]}: Received OUT_NUM_BYTES=\"$OUT_NUM_BYTES\", OUT_BYTES=\"$OUT_BYTES\"."
+	#
+	# Return stdout, if we have any.
+	echo $OUT_BYTES
+	#
+	if [[ "$X_RECEIVE" -ne 0 ]] ; then # Return nonzero exit codes upwards.
+		return $X_RECEIVE
+	fi
+	# Exit codes: 0=success, 9=timeout, 7=xmit failure, 2=invalid input
+}
+
+f_ping() {
+	# Check in with the controller and make sure it's alive.
+	# If we send a "c0" we should get a "21" back from the controller.
+	HELLO_REPLY=$(f_sendhex c0) ; X_SENDHEX_PING=$?
+	echodebug "DEBUG: ${FUNCNAME[0]}: f_sendhex returned \"$X_SENDHEX_PING\"."
+	#
+	if [[ "$X_SENDHEX_PING" == 9 ]] ; then # f_sendhex timed out.
+		echoerr ""
+		echoerr "ERROR: Command to controller timed out. No reply received. (Do you need to \"$MYNAME init\"?)"
+		echoerr ""
+		return $X_SENDHEX_PING
+	elif [[ "$X_SENDHEX_PING" == 7 ]] ; then # Transmission failure.
+		echoerr ""
+		echoerr "ERROR: Transmission failure. The device is not ready."
+		echoerr ""
+		return $X_SENDHEX_PING
+	elif [[ ! "$X_SENDHEX_PING" == 0 ]] ; then # Other errors.
+		echoerr ""
+		echoerr "ERROR: f_sendhex returned exit code \"$X_SENDHEX_PING\""
+		echoerr ""
+		return $X_SENDHEX_PING
+	fi
+	#
+	if [[ "$HELLO_REPLY" == 21 ]] ; then # "21" is the correct response to a "c0" ping, but I've seen 18 and 02 too.
+		echo ""
+		echo "Success! Controller responded to our ping."
+		echo ""
+		return 0
+	elif ( echo "$HELLO_REPLY" | egrep "^[0-9A-F]{2}$" &> /dev/null ) ; then
+		echo ""
+		echo "Failure. Controller replied with \"$HELLO_REPLY\". (Out of sync or booting?)"
+		echo ""
+		return 2
+	fi
+}
+
+f_init_knock() {
+	# Blindly send garbage requests to the interface. Dribbling it one at a time doesn't seem to trigger sync.
+	f_setup_dev || return $?
+	echodebug "DEBUG: ${FUNCNAME[0]}: Sending a flurry of crap requests at the device to help it sync."
+	declare -i SENDCRAP=0 ; while true ; do
+		SENDCRAP=$(( $SENDCRAP + 1 ))
+		[[ "$SENDCRAP" -ge 8 ]] && break # Do it this many times.
+		echo -ne "\\xC0" > $GRID_DEV 2> /dev/null
+		# echo -ne "\\x8a\\x01" > $GRID_DEV 2> /dev/null
+		while read -t 0 FLUSH < $GRID_DEV ; do continue ; done &> /dev/null
+		sleep 0.1
+	done ; unset SENDCRAP
+}
+
+f_init() {
+	# Initialize the controller. This needs to be done once after each boot up.
+	# The best way to do this is to ping the controller until it replies.
+	echo ""
+	echo "Trying to initialize communications with the controller."
+	echo ""
+	echo -n "  Please wait:"
+	declare -i INIT_COUNT=0
+	while true ; do
+		INIT_COUNT=$(( $INIT_COUNT + 1 ))
+		if [[ "$INIT_COUNT" -ge 30 ]] ; then # How many times to try before giving up.
+			echoerr ""
+			echoerr "ERROR: Giving up after $INIT_COUNT tries."
+			echoerr ""
+			return 1
+		fi
+		#
+		f_init_knock # For some reason, the Grid+ does not wake up until we really knock on it for a bit.
+		#
+		# f_ping &> /dev/null ; X_INIT_PING=$? # FIXME: We still want to get DEBUGs output.
+		f_ping 2>&1 | egrep "^DEBUG: " ; X_INIT_PING=${PIPESTATUS[0]} # Show debugs only.
+		echodebug "DEBUG: ${FUNCNAME[0]}: \"X_INIT_PING=$X_INIT_PING\"."
+		if [[ "$X_INIT_PING" == 0 ]] ; then # Success!
+			echo ""
+			echo ""
+			echo "Success! Controller initialized."
+			echo ""
+			return 0
+		elif [[ "$X_INIT_PING" == 9 ]] ; then # Timeout.
+			echo -n "."
+		elif [[ "$X_INIT_PING" == 7 ]] ; then # Transmission failure.
+			echo -n "f"
+			sleep 1
+		elif [[ "$X_INIT_PING" == 2 ]] ; then # Invalid reply, but it's alive.
+			echo -n "?"
+		else # Any other weird error.
+			echo -n "x"
+		fi
+	done ; unset INIT_COUNT
+	echo ""
+}
+
+f_show_fans() {
+	# Show info for one or more fans. Input should be one or more fan IDs, which means 1-6.
+	unset FAN_IDS FAN_NUM SHOW_FAN_REPLY
+	# FAN_IDS=$SHOW_FAN_ID_LIST
+	FAN_IDS=$@
+	FAN_NUM=$#
+	#
+	echo "" # Pad our stdout.
+	# Validate format of input; fan IDs, 1-6.
+	for EACH in $FAN_IDS ; do
+		( echo "$EACH" | egrep "^[1-6]$" &> /dev/null ) || {
+			echoerr "ERROR: ${FUNCNAME[0]} fan ID \"$EACH\" is invalid."
+			return 2 ; }
+	done ; unset EACH
+	#
+	# Iterate through the fan IDs.
+	for EACH in $FAN_IDS ; do
+		echodebug "DEBUG: ${FUNCNAME[0]}: Getting fan info for ID $EACH."
+		SHOW_FAN_REPLY=$(f_sendhex 8a 0$EACH) ; X_SENDHEX_SHOWFAN=$?
+		# The reply should be something like "C0 00 00 02 76".
+		#   "C0 00 00" is always the same and the last two bytes are the fan speed RPM in hex.
+		echodebug "DEBUG: ${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SHOWFAN\"."
+		[[ "$X_SENDHEX_SHOWFAN" -ne 0 ]] && return $X_SENDHEX_SHOWFAN # Stop here if f_sendhex failed.
+		#
+		# First, validate the reply.
+		if ! ( echo "$SHOW_FAN_REPLY" | egrep "^C0 00 00 [0-9A-F]{2} [0-9A-F]{2}$" &> /dev/null ) ; then
+			echoerr "ERROR: Show fan ID \"$EACH\" controller reply was invalid: \"$SHOW_FAN_REPLY\"."
+			SEEN_ERROR=2
+		fi
+		#
+		# All that we really care about is the last two bytes. Bash itself can do the hex to decimal conversion.
+		FAN_RPM=$((16#$(echo $SHOW_FAN_REPLY | tr -d ' ' | cut -c 7-10)))
+		#
+		echo "Fan $EACH: $FAN_RPM RPM"
+	done ; unset EACH FAN_RPM SHOW_FAN_REPLY
+	#
+	echo "" # Pad our stdout.
+	# Return a reasonable exit code depending on if we saw any errors.
+	if [[ "$SEEN_ERROR" -ne 0 ]] ; then
+		return $SEEN_ERROR
+	fi
+}
+
+f_set_fan_speed() {
+	# Set the speed or one or more fans.
+	#
+	echo "" # Pad our stdout.
+	#
+	# FIXME: Validate fan IDs? standardize a func between this and other uses.
+	#
+	# Translate decimal speed % to hex.
+	if [[ "$SET_FAN_SPEED" == 0 ]] ; then SPEED_HEX="00 00"
+	elif [[ "$SET_FAN_SPEED" == 20 ]] ; then SPEED_HEX="04 00"
+	elif [[ "$SET_FAN_SPEED" == 25 ]] ; then SPEED_HEX="04 50"
+	elif [[ "$SET_FAN_SPEED" == 30 ]] ; then SPEED_HEX="05 00"
+	elif [[ "$SET_FAN_SPEED" == 35 ]] ; then SPEED_HEX="05 50"
+	elif [[ "$SET_FAN_SPEED" == 40 ]] ; then SPEED_HEX="06 00"
+	elif [[ "$SET_FAN_SPEED" == 45 ]] ; then SPEED_HEX="06 50"
+	elif [[ "$SET_FAN_SPEED" == 50 ]] ; then SPEED_HEX="07 00"
+	elif [[ "$SET_FAN_SPEED" == 55 ]] ; then SPEED_HEX="07 50"
+	elif [[ "$SET_FAN_SPEED" == 60 ]] ; then SPEED_HEX="08 00"
+	elif [[ "$SET_FAN_SPEED" == 65 ]] ; then SPEED_HEX="08 50"
+	elif [[ "$SET_FAN_SPEED" == 70 ]] ; then SPEED_HEX="09 00"
+	elif [[ "$SET_FAN_SPEED" == 75 ]] ; then SPEED_HEX="09 50"
+	elif [[ "$SET_FAN_SPEED" == 80 ]] ; then SPEED_HEX="0a 00"
+	elif [[ "$SET_FAN_SPEED" == 85 ]] ; then SPEED_HEX="0a 50"
+	elif [[ "$SET_FAN_SPEED" == 90 ]] ; then SPEED_HEX="0b 00"
+	elif [[ "$SET_FAN_SPEED" == 95 ]] ; then SPEED_HEX="0b 50"
+	elif [[ "$SET_FAN_SPEED" == 100 ]] ; then SPEED_HEX="0c 00"
+	else
+		echoerr "ERROR: ${FUNCNAME[0]} Invalid speed: \"$SET_FAN_SPEED\"."
+		return 1
+	fi
+	#
+	for EACH in ${ar_SET_FAN_IDS[@]} ; do
+		echodebug "DEBUG: ${FUNCNAME[0]}: Setting fan \"$EACH\" to speed \"$SET_FAN_SPEED\"."
+		SET_FAN_SPEED_REPLY=$(f_sendhex 44 0$EACH c0 00 00 $SPEED_HEX) ; X_SENDHEX_SETFANSPEED=$?
+		# The reply should be "01" for success.
+		echodebug "DEBUG: ${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SETFANSPEED\"."
+		[[ "$X_SENDHEX_SETFANSPEED" -ne 0 ]] && return $? # Stop here if f_sendhex failed.
+		#
+		# Validate the reply.
+		if ( echo "$SET_FAN_SPEED_REPLY" | egrep "^01$" &> /dev/null ) ; then
+			echo "Fan $EACH successfully set to ${SET_FAN_SPEED}% speed."
+		elif [[ -z "$SET_FAN_SPEED_REPLY" ]] ; then
+			echoerr "ERROR: Failed to set fan \"$EACH\" to \"${SET_FAN_SPEED}%\" speed. Controller did not reply."
+			SEEN_ERROR=2
+		else
+			echoerr "ERROR: Failed to set fan \"$EACH\" to \"${SET_FAN_SPEED}%\" speed. Controller reply was invalid: \"$SHOW_FAN_REPLY\"."
+			SEEN_ERROR=2
+		fi
+	done ; unset EACH
+	#
+	echo "" # Pad our stdout.
+	# Return a reasonable exit code depending on if we saw any errors.
+	if [[ "$SEEN_ERROR" -ne 0 ]] ; then
+		return $SEEN_ERROR
+	fi
+}
+
+#--
+
+# No input? Print usage and exit 1.
+[[ "$#" -eq 0 ]] && { f_printusage ; exit 1 ; }
+
+while [[ "$#" -gt 0 ]] ; do case "$1" in
+	--debug|-D)
+		SCRIPT_DEBUG=1
+		# set -o functrace
+		# set -x
+		shift 1
+	;;
+	--device|-d)
+		GRID_DEV=$2
+		shift 2
+	;;
+	ping|hello)
+		f_ping
+		exit $?
+	;;
+	init|sync)
+		f_init
+		exit $?
+	;;
+	show|get)
+		case "$2" in
+			fan|fans) # Show info for one or more fans.
+				# FIXME: speed is an argument to the "set" command. Why not here too? Inconsistent.
+				shift 2
+				SHOW_FAN_ID_LIST=$@
+				[[ "$SHOW_FAN_ID_LIST" == all ]] && SHOW_FAN_ID_LIST="1 2 3 4 5 6" # For "show fans all".
+				f_show_fans $SHOW_FAN_ID_LIST
+				exit $?
+			;;
+			all|everything) # Show everything (not just fans, but that's all we have right now).
+				shift 2
+				SHOW_FAN_ID_LIST="1 2 3 4 5 6"
+				f_show_fans $SHOW_FAN_ID_LIST
+				exit $?
+			;;
+			*)
+				echoerr ""
+				echoerr "ERROR: Invalid argument. What do you want to show?"
+				f_printusage
+				exit 1
+			;;
+		esac
+	;;
+	set)
+		case "$2" in
+			fan|fans) # Set fan speeds.
+				shift 2
+					declare -a ar_SET_FAN_IDS
+					while [[ "$#" -gt 0 ]] ; do case "$1" in # Now we need to grab the list of fan IDs and the speed argument.
+						# FIXME: Add special word "off", ala: "gridfan set fan 1 off"
+						# FIXME: What about "gridfan set fans off"?
+						# FIXME: It is possible to do stupid stuff like "gridfan set fans 1 1 1 1 1 1 1 1 1 speed 0".
+						1|2|3|4|5|6) # Valid fan IDs.
+							ar_SET_FAN_IDS+=("$1")
+							shift 1
+						;;
+						all)
+							ar_SET_FAN_IDS=(1 2 3 4 5 6)
+							shift 1
+
+						;;
+						speed)
+							if [[ "${#ar_SET_FAN_IDS[@]}" == 0 ]] ; then # If ar_SET_FAN_IDS is empty, that's an error.
+								echoerr ""
+								echoerr "ERROR: No fan IDs supplied to the \"set fan X speed\" command."
+								echoerr ""
+								exit 1
+							fi
+							shift 1
+							IN_SPEED=$1
+							IN_SPEED=$(echo $IN_SPEED | tr -d '%') # Get rid of any trailing % sign.
+							#
+							# Speed value may or may not include the percent sign %, but we strip it either way.
+							# The speed must be 0%, or 20%-100% in 5% increments. Not less than 20% except zero.
+							# Valid speeds: 0, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100
+							#
+							case "$IN_SPEED" in
+								off|0|20|25|30|35|40|45|50|55|60|65|70|75|80|85|90|95|100)
+									SET_FAN_SPEED=$IN_SPEED
+									shift 1
+									[[ "$SET_FAN_SPEED" == "off" ]] && SET_FAN_SPEED=0 # "off" is an alias for "0".
+									f_set_fan_speed
+									exit $?
+								;;
+								*)
+									echoerr ""
+									echoerr "ERROR: Invalid speed. Must be 0% or 20-100% in 5% increments."
+									echoerr ""
+									exit 1
+								;;
+							esac
+						;;
+						*) # Anything else is an error.
+							echoerr ""
+							echoerr "ERROR: Invalid argument to the \"fan\" parameter. Must be at least one fan ID [1-6] or \"all\"."
+							echoerr ""
+							exit 1
+						;;
+					esac ; done
+					if [[ "$#" -eq 0 ]] ; then
+						echoerr ""
+						echoerr "ERROR: Missing parameters for the \"set fan\" command. See \"$MYNAME --help\" for usage info."
+						echoerr ""
+						exit 1
+					fi
+				exit $?
+			;;
+			*)
+				echoerr ""
+				echoerr "ERROR: Invalid argument. What do you want to set?"
+				f_printusage
+				exit 1
+			;;
+		esac
+	;;
+	help|--help|-h|-H)
+		f_help
+		exit $?
+	;;
+	*)
+		echoerr ""
+		echoerr "ERROR: Invalid argument."
+		f_printusage
+		exit 1
+	;;
+esac ; done
+
