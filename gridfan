@@ -2,7 +2,7 @@
 #
 # gridfan: A simple controller script for the NZXT Grid+ V2 fan controller.
 
-VERSION=1.1
+VERSION=1.2
 MYNAME=$(basename $0)
 GRID_DEV=/dev/GridPlus0 # Default device file if not set with -d.
 
@@ -17,7 +17,7 @@ echoerr() {
 echodebug() {
 	# Print debug messages to stderr if debugging enabled.
 	if [[ "$SCRIPT_DEBUG" == 1 ]] ; then
-		echo "$@" 1>&2;
+		echo "DEBUG: $@" 1>&2;
 	fi
 }
 
@@ -80,11 +80,11 @@ f_setup_dev() {
 	# Set up the tty device with stty.
 	if [[ "$SEEN_SETUP_STTY" == 1 ]] ; then # We've already been here once, no need to do it again.
 		# FIXME: This never happens because of capturing stdout on $(f_sendhex), which happens in a subshell.
-		echodebug "DEBUG: ${FUNCNAME[0]}: Already set up stty parameters. Not doing it again."
+		echodebug "${FUNCNAME[0]}: Already set up stty parameters. Not doing it again."
 		return 0
 	fi
 	STTY_PARAMS="4800 raw -echo -echoe -echok"
-	echodebug "DEBUG: ${FUNCNAME[0]}: stty setting parameters to the device: \"$STTY_PARAMS\"."
+	echodebug "${FUNCNAME[0]}: stty setting parameters to the device: \"$STTY_PARAMS\"."
 	stty -F $GRID_DEV $STTY_PARAMS &> /dev/null ; X_STTY=$?
 	SEEN_SETUP_STTY=1
 	if [[ ! "$X_STTY" == 0 ]] ; then
@@ -110,10 +110,10 @@ f_xmit() {
 	f_setup_dev || return $?
 	#
 	# FIXME: If there is old data in the buffer, we need to flush it first. This is non-ideal but apparently works.
-	echodebug "DEBUG: ${FUNCNAME[0]}: Flushing device output before transmission."
+	echodebug "${FUNCNAME[0]}: Flushing device output before transmission."
 	while read -t 0 FLUSH < $GRID_DEV ; do continue ; done &> /dev/null ; X_FLUSH_DEV=$? ; unset FLUSH ; true
 	#
-	echodebug "DEBUG: ${FUNCNAME[0]}: Sending XMIT_CMD \"$XMIT_CMD\" to GRID_DEV \"$GRID_DEV\"."
+	echodebug "${FUNCNAME[0]}: Sending XMIT_CMD \"$XMIT_CMD\" to GRID_DEV \"$GRID_DEV\"."
 	echo -ne "$XMIT_CMD" > $GRID_DEV 2>/dev/null ; X_XMIT=$?
 	# FIXME: Can we lock the device?
 	return $X_XMIT
@@ -128,11 +128,11 @@ f_receive() {
 	X_RECEIVE=0 # FIXME: Lazy.
 	while ( kill -s 0 $PID_HEXDUMP &> /dev/null ) ; do # Check if the process still exists (is waiting).
 		WAIT_COUNT=$(( $WAIT_COUNT + 1 ))
-		echodebug "DEBUG: ${FUNCNAME[0]}: Waiting for hexdump pipeline to finish. \"PID=$PID_HEXDUMP\", \"WAIT_COUNT=$WAIT_COUNT\"."
+		echodebug "${FUNCNAME[0]}: Waiting for hexdump pipeline to finish. \"PID=$PID_HEXDUMP\", \"WAIT_COUNT=$WAIT_COUNT\"."
 		if [[ "$WAIT_COUNT" -ge 100 ]] ; then # This number multiplied by the sleep is how long we wait.
-			echodebug "DEBUG: ${FUNCNAME[0]}: Killing hexdump pipeline due to timeout."
+			echodebug "${FUNCNAME[0]}: Killing hexdump pipeline due to timeout."
 			kill -s TERM $PID_HEXDUMP &> /dev/null
-			echodebug "DEBUG: ${FUNCNAME[0]}: hexdump pipeline killed."
+			echodebug "${FUNCNAME[0]}: hexdump pipeline killed."
 			X_RECEIVE=9
 			break
 		fi
@@ -157,7 +157,7 @@ f_sendhex() {
 	IN_BYTES=$(echo "$IN_BYTES" | tr [:lower:] [:upper:]) # Change case of input to upper.
 	IN_NUM_BYTES=$#
 	CMD_BYTE=$(echo "$IN_BYTES" | cut -f 1 -d ' ')
-	echodebug "DEBUG: ${FUNCNAME[0]}: input \"IN_BYTES=$IN_BYTES\", \"IN_NUM_BYTES=$IN_NUM_BYTES\"."
+	echodebug "${FUNCNAME[0]}: input \"IN_BYTES=$IN_BYTES\", \"IN_NUM_BYTES=$IN_NUM_BYTES\"."
 	#
 	if [[ "$IN_BYTES" == 0 ]] ; then
 		echoerr ""
@@ -214,8 +214,8 @@ f_sendhex() {
 	f_xmit "$IN_BYTES" || return 7
 	OUT_BYTES=$(f_receive) ; X_RECEIVE=$?
 	OUT_NUM_BYTES=$(echo "$OUT_BYTES" | wc -w)
-	echodebug "DEBUG: ${FUNCNAME[0]}: f_receive exit code \"$X_RECEIVE\"."
-	echodebug "DEBUG: ${FUNCNAME[0]}: Received OUT_NUM_BYTES=\"$OUT_NUM_BYTES\", OUT_BYTES=\"$OUT_BYTES\"."
+	echodebug "${FUNCNAME[0]}: f_receive exit code \"$X_RECEIVE\"."
+	echodebug "${FUNCNAME[0]}: Received OUT_NUM_BYTES=\"$OUT_NUM_BYTES\", OUT_BYTES=\"$OUT_BYTES\"."
 	#
 	# Return stdout, if we have any.
 	echo $OUT_BYTES
@@ -230,7 +230,7 @@ f_ping() {
 	# Check in with the controller and make sure it's alive.
 	# If we send a "c0" we should get a "21" back from the controller.
 	HELLO_REPLY=$(f_sendhex c0) ; X_SENDHEX_PING=$?
-	echodebug "DEBUG: ${FUNCNAME[0]}: f_sendhex returned \"$X_SENDHEX_PING\"."
+	echodebug "${FUNCNAME[0]}: f_sendhex returned \"$X_SENDHEX_PING\"."
 	#
 	if [[ "$X_SENDHEX_PING" == 9 ]] ; then # f_sendhex timed out.
 		echoerr ""
@@ -265,7 +265,7 @@ f_ping() {
 f_init_knock() {
 	# Blindly send garbage requests to the interface. Dribbling it one at a time doesn't seem to trigger sync.
 	f_setup_dev || return $?
-	echodebug "DEBUG: ${FUNCNAME[0]}: Sending a flurry of crap requests at the device to help it sync."
+	echodebug "${FUNCNAME[0]}: Sending a flurry of crap requests at the device to help it sync."
 	declare -i SENDCRAP=0 ; while true ; do
 		SENDCRAP=$(( $SENDCRAP + 1 ))
 		[[ "$SENDCRAP" -ge 8 ]] && break # Do it this many times.
@@ -292,12 +292,15 @@ f_init() {
 			echoerr ""
 			return 1
 		fi
+		echodebug "${FUNCNAME[0]}: Starting init try count $INIT_COUNT."
 		#
-		f_init_knock # For some reason, the Grid+ does not wake up until we really knock on it for a bit.
+		f_init_knock # For some unknown reason, the Grid+ does not wake up until we really knock on it for a bit.
 		#
-		# f_ping &> /dev/null ; X_INIT_PING=$? # FIXME: We still want to get DEBUGs output.
-		f_ping 2>&1 | egrep "^DEBUG: " ; X_INIT_PING=${PIPESTATUS[0]} # Show debugs only.
-		echodebug "DEBUG: ${FUNCNAME[0]}: \"X_INIT_PING=$X_INIT_PING\"."
+		f_ping &> /dev/null ; X_INIT_PING=$? # FIXME: We still want to get DEBUGs output.
+		# f_ping 3>&1 1>/dev/null 2>&3 | egrep "DEBUG: " ; X_INIT_PING=${PIPESTATUS[0]} # Show debugs only. # FIXME: Why does this not work?
+		# This works fine: ping google.comfff 3>&1 1>/dev/null 2>&3 | egrep "not known" ; echo "${PIPESTATUS[0]}"
+		#
+		echodebug "${FUNCNAME[0]}: \"X_INIT_PING=$X_INIT_PING\"."
 		if [[ "$X_INIT_PING" == 0 ]] ; then # Success!
 			echo ""
 			echo ""
@@ -335,11 +338,11 @@ f_show_fans() {
 	#
 	# Iterate through the fan IDs.
 	for EACH in $FAN_IDS ; do
-		echodebug "DEBUG: ${FUNCNAME[0]}: Getting fan info for ID $EACH."
+		echodebug "${FUNCNAME[0]}: Getting fan info for ID $EACH."
 		SHOW_FAN_REPLY=$(f_sendhex 8a 0$EACH) ; X_SENDHEX_SHOWFAN=$?
 		# The reply should be something like "C0 00 00 02 76".
 		#   "C0 00 00" is always the same and the last two bytes are the fan speed RPM in hex.
-		echodebug "DEBUG: ${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SHOWFAN\"."
+		echodebug "${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SHOWFAN\"."
 		[[ "$X_SENDHEX_SHOWFAN" -ne 0 ]] && return $X_SENDHEX_SHOWFAN # Stop here if f_sendhex failed.
 		#
 		# First, validate the reply.
@@ -393,10 +396,10 @@ f_set_fan_speed() {
 	fi
 	#
 	for EACH in ${ar_SET_FAN_IDS[@]} ; do
-		echodebug "DEBUG: ${FUNCNAME[0]}: Setting fan \"$EACH\" to speed \"$SET_FAN_SPEED\"."
+		echodebug "${FUNCNAME[0]}: Setting fan \"$EACH\" to speed \"$SET_FAN_SPEED\"."
 		SET_FAN_SPEED_REPLY=$(f_sendhex 44 0$EACH c0 00 00 $SPEED_HEX) ; X_SENDHEX_SETFANSPEED=$?
 		# The reply should be "01" for success.
-		echodebug "DEBUG: ${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SETFANSPEED\"."
+		echodebug "${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SETFANSPEED\"."
 		[[ "$X_SENDHEX_SETFANSPEED" -ne 0 ]] && return $? # Stop here if f_sendhex failed.
 		#
 		# Validate the reply.
