@@ -2,7 +2,7 @@
 #
 # gridfan: A simple controller script for the NZXT Grid+ V2 fan controller.
 
-VERSION=1.0
+VERSION=1.1
 MYNAME=$(basename $0)
 GRID_DEV=/dev/GridPlus0 # Default device file if not set with -d.
 
@@ -83,7 +83,7 @@ f_setup_dev() {
 		echodebug "DEBUG: ${FUNCNAME[0]}: Already set up stty parameters. Not doing it again."
 		return 0
 	fi
-	STTY_PARAMS="9600 raw -echo -echoe -echok"
+	STTY_PARAMS="4800 raw -echo -echoe -echok"
 	echodebug "DEBUG: ${FUNCNAME[0]}: stty setting parameters to the device: \"$STTY_PARAMS\"."
 	stty -F $GRID_DEV $STTY_PARAMS &> /dev/null ; X_STTY=$?
 	SEEN_SETUP_STTY=1
