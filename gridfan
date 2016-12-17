@@ -85,7 +85,11 @@ f_setup_dev() {
 	fi
 	STTY_PARAMS="4800 raw -echo -echoe -echok"
 	echodebug "${FUNCNAME[0]}: stty setting parameters to the device: \"$STTY_PARAMS\"."
-	stty -F $GRID_DEV $STTY_PARAMS &> /dev/null ; X_STTY=$?
+	if [[ "$OSTYPE" == "darwin"* ]]; then
+		stty -f $GRID_DEV $STTY_PARAMS &> /dev/null ; X_STTY=$?
+	else
+		stty -F $GRID_DEV $STTY_PARAMS &> /dev/null ; X_STTY=$?
+	fi
 	SEEN_SETUP_STTY=1
 	if [[ ! "$X_STTY" == 0 ]] ; then
 		echoerr "ERROR: stty returned code $X_STTY. Unable to set up the serial device file."
