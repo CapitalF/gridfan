@@ -2,7 +2,7 @@
 #
 # gridfan: A simple controller script for the NZXT Grid+ V2 fan controller.
 
-VERSION=1.3
+VERSION=1.5
 MYNAME=$(basename $0)
 GRID_DEV=/dev/GridPlus0 # Default device file if not set with -d.
 
@@ -79,7 +79,7 @@ f_validate_dev() {
 f_setup_dev() {
 	# Set up the tty device with stty.
 	if [[ "$SEEN_SETUP_STTY" == 1 ]] ; then # We've already been here once, no need to do it again.
-		# FIXME: This never happens because of capturing stdout on $(f_sendhex), which happens in a subshell.
+		# NOTE: We can not call this fun within $(f_sendhex), because it's a subshell and the variable won't go global.
 		echodebug "${FUNCNAME[0]}: Already set up stty parameters. Not doing it again."
 		return 0
 	fi
@@ -102,36 +102,47 @@ f_sendhex_validate_in_bytes() {
 }
 
 f_xmit() {
-	# Take our IN_BYTES, convert it to a bash/echo-able string, and send it.
+	# Take our IN_BYTES, convert it to a bash/echo-able string.
 	for EACH in $@ ; do
 		XMIT_CMD="${XMIT_CMD}\\x$EACH"
 	done ; unset EACH
-	f_validate_dev || return $?
-	f_setup_dev || return $?
 	#
-	# FIXME: If there is old data in the buffer, we need to flush it first. This is non-ideal but apparently works.
+	# If there is old data in the buffer, we need to flush it first. This is non-ideal but apparently works.
 	echodebug "${FUNCNAME[0]}: Flushing device output before transmission."
 	while read -t 0 FLUSH < $GRID_DEV ; do continue ; done &> /dev/null ; X_FLUSH_DEV=$? ; unset FLUSH ; true
 	#
+	# Start hexdump in the background to recieve output from the device. Gather the reply later.
+	echodebug "${FUNCNAME[0]}: Backgrounding the hexdump receiver."
+	hexdump -n $OUT_VALID_BYTES -v -e '/1 "%02X "' < $GRID_DEV | tr [:lower:] [:upper:] | egrep -o "([0-9A-F]{2} )*[0-9A-F]{2}" & PID_PIPELINE_HEXDUMP=$!
+	#
+	# We need the PID of hexdump itself, not the last command in the pipeline. Getting that is a pain. BASH needs a special PIPEPID array like PIPESTATUS.
+	PID_HEXDUMP=$(jobs -l | egrep hexdump | awk '{print $2}' | tr -d -c [:digit:]) # We could just do "jobs -p" here, but I don't think it's safe enough.
+	if [[ -z "$PID_HEXDUMP" ]] ; then
+		echoerr "ERROR: Failed to get the hexdump PID."
+		kill "$(jobs -p)" # We have to kill the hexdump pipeline and all background jobs or this hangs.
+		return 7
+	fi
+	#
+	# We must wait for hexdump to spawn and have opened stdout on the GRID_DEV.
+	# I figure the best way to verify that lsof has opened the device is to use lsof, but this is slow.
+	until ( lsof -p $PID_HEXDUMP | egrep -o "$(readlink -f $GRID_DEV)$" &> /dev/null ) ; do
+		echodebug "${FUNCNAME[0]}: Waiting for hexdump to spawn. PID_HEXDUMP=$PID_HEXDUMP"
+		sleep 0.01
+	done
+	#
+	# Input data to the device.
 	echodebug "${FUNCNAME[0]}: Sending XMIT_CMD \"$XMIT_CMD\" to GRID_DEV \"$GRID_DEV\"."
 	echo -ne "$XMIT_CMD" > $GRID_DEV 2>/dev/null ; X_XMIT=$?
-	# FIXME: Can we lock the device?
-	return $X_XMIT
-}
-
-f_receive() {
-	# Gather data from the controller serial port.
 	#
-	hexdump -n $OUT_VALID_BYTES -v -e '/1 "%02X "' < $GRID_DEV | tr [:lower:] [:upper:] | egrep -o "([0-9A-F]{2} )*[0-9A-F]{2}" & PID_HEXDUMP=$!
-	# Start hexdump above in the background, then wait for a reply.
+	# Wait for the hexdump reply.
 	declare -i WAIT_COUNT=0
 	X_RECEIVE=0 # FIXME: Lazy.
-	while ( kill -s 0 $PID_HEXDUMP &> /dev/null ) ; do # Check if the process still exists (is waiting).
+	while ( kill -s 0 $PID_PIPELINE_HEXDUMP &> /dev/null ) ; do # Check if the process still exists (is waiting).
 		WAIT_COUNT=$(( $WAIT_COUNT + 1 ))
-		echodebug "${FUNCNAME[0]}: Waiting for hexdump pipeline to finish. \"PID=$PID_HEXDUMP\", \"WAIT_COUNT=$WAIT_COUNT\"."
+		echodebug "${FUNCNAME[0]}: Waiting for hexdump pipeline to finish. \"PID=$PID_PIPELINE_HEXDUMP\", \"WAIT_COUNT=$WAIT_COUNT\"."
 		if [[ "$WAIT_COUNT" -ge 100 ]] ; then # This number multiplied by the sleep is how long we wait.
 			echodebug "${FUNCNAME[0]}: Killing hexdump pipeline due to timeout."
-			kill -s TERM $PID_HEXDUMP &> /dev/null
+			kill -s TERM $PID_PIPELINE_HEXDUMP &> /dev/null
 			echodebug "${FUNCNAME[0]}: hexdump pipeline killed."
 			X_RECEIVE=9
 			break
@@ -139,11 +150,7 @@ f_receive() {
 		sleep 0.01
 	done ; unset WAIT_COUNT
 	#
-	# I dobut that tr is needed, but whatever.
-	# The grep will eliminate trailing spaces, and anything else invalid.
-	#
-	# hexdump -n $OUT_VALID_BYTES -v -e '/1 "%02X "' < $GRID_DEV | tr [:lower:] [:upper:] | egrep -o "([0-9A-F]{2} )*[0-9A-F]{2}" ; X_RECEIVE=0
-	#
+	[[ "$X_XMIT" -ne 0 ]] && return 7 # Xmit errors take precidence over a receive error, obviously.
 	return $X_RECEIVE
 }
 
@@ -211,10 +218,9 @@ f_sendhex() {
 	f_sendhex_validate_in_bytes || return 2
 	#
 	# Finally, we transmit the command to the serial port and get the reply.
-	f_xmit "$IN_BYTES" || return 7
-	OUT_BYTES=$(f_receive) ; X_RECEIVE=$?
+	OUT_BYTES=$(f_xmit "$IN_BYTES") ; X_RECEIVE=$?
 	OUT_NUM_BYTES=$(echo "$OUT_BYTES" | wc -w)
-	echodebug "${FUNCNAME[0]}: f_receive exit code \"$X_RECEIVE\"."
+	echodebug "${FUNCNAME[0]}: f_xmit exit code \"$X_RECEIVE\"."
 	echodebug "${FUNCNAME[0]}: Received OUT_NUM_BYTES=\"$OUT_NUM_BYTES\", OUT_BYTES=\"$OUT_BYTES\"."
 	#
 	# Return stdout, if we have any.
@@ -228,6 +234,11 @@ f_sendhex() {
 
 f_ping() {
 	# Check in with the controller and make sure it's alive.
+	#
+	# Prepare to talk to the device.
+	f_validate_dev || return $?
+	f_setup_dev || return $?
+	#
 	# If we send a "c0" we should get a "21" back from the controller.
 	HELLO_REPLY=$(f_sendhex c0) ; X_SENDHEX_PING=$?
 	echodebug "${FUNCNAME[0]}: f_sendhex returned \"$X_SENDHEX_PING\"."
@@ -249,7 +260,7 @@ f_ping() {
 		return $X_SENDHEX_PING
 	fi
 	#
-	if [[ "$HELLO_REPLY" == 21 ]] ; then # "21" is the correct response to a "c0" ping, but I've seen 18 and 02 too.
+	if [[ "$HELLO_REPLY" == 21 ]] ; then # "21" is the correct response to a "c0" ping, but I've seen 18 and 02 also.
 		echo ""
 		echo "Success! Controller responded to our ping."
 		echo ""
@@ -294,7 +305,7 @@ f_init() {
 		fi
 		echodebug "${FUNCNAME[0]}: Starting init try count $INIT_COUNT."
 		#
-		f_init_knock # For some unknown reason, the Grid+ does not wake up until we really knock on it for a bit.
+		f_init_knock &> /dev/null # For some unknown reason, the Grid+ does not wake up until we really knock on it for a bit.
 		#
 		f_ping &> /dev/null ; X_INIT_PING=$? # FIXME: We still want to get DEBUGs output.
 		# f_ping 3>&1 1>/dev/null 2>&3 | egrep "DEBUG: " ; X_INIT_PING=${PIPESTATUS[0]} # Show debugs only. # FIXME: Why does this not work?
@@ -314,6 +325,7 @@ f_init() {
 			sleep 0.5
 		elif [[ "$X_INIT_PING" == 2 ]] ; then # Invalid reply, but it's alive.
 			echo -n "?"
+			sleep 0.5
 		else # Any other weird error.
 			echo -n "x"
 			sleep 0.5
@@ -336,6 +348,10 @@ f_show_fans() {
 			echoerr "ERROR: ${FUNCNAME[0]} fan ID \"$EACH\" is invalid."
 			return 2 ; }
 	done ; unset EACH
+	#
+	# Prepare to talk to the device.
+	f_validate_dev || return $?
+	f_setup_dev || return $?
 	#
 	# Iterate through the fan IDs.
 	for EACH in $FAN_IDS ; do
@@ -378,7 +394,7 @@ f_set_fan_speed() {
 	#
 	# Translate decimal speed % to hex code.
 	if [[ "$SET_FAN_SPEED" == 0 ]] ; then SPEED_HEX="00 00"
-	elif [[ "$SET_FAN_SPEED" == 20 ]] ; then SPEED_HEX="04 00"
+	elif [[ "$SET_FAN_SPEED" == 20 ]] ; then SPEED_HEX="04 00" # x0400 = 4V = 20%
 	elif [[ "$SET_FAN_SPEED" == 25 ]] ; then SPEED_HEX="04 50"
 	elif [[ "$SET_FAN_SPEED" == 30 ]] ; then SPEED_HEX="05 00"
 	elif [[ "$SET_FAN_SPEED" == 35 ]] ; then SPEED_HEX="05 50"
@@ -394,28 +410,31 @@ f_set_fan_speed() {
 	elif [[ "$SET_FAN_SPEED" == 85 ]] ; then SPEED_HEX="0a 50"
 	elif [[ "$SET_FAN_SPEED" == 90 ]] ; then SPEED_HEX="0b 00"
 	elif [[ "$SET_FAN_SPEED" == 95 ]] ; then SPEED_HEX="0b 50"
-	elif [[ "$SET_FAN_SPEED" == 100 ]] ; then SPEED_HEX="0c 00"
+	elif [[ "$SET_FAN_SPEED" == 100 ]] ; then SPEED_HEX="0c 00" # x0c00 = 12V = 100%
 	else
 		echoerr "ERROR: ${FUNCNAME[0]} Invalid speed: \"$SET_FAN_SPEED\"."
 		return 1
 	fi
+	#
+	# Prepare to talk to the device.
+	f_validate_dev || return $?
+	f_setup_dev || return $?
 	#
 	for EACH in ${ar_SET_FAN_IDS[@]} ; do
 		echodebug "${FUNCNAME[0]}: Setting fan \"$EACH\" to speed \"$SET_FAN_SPEED\"."
 		SET_FAN_SPEED_REPLY=$(f_sendhex 44 0$EACH c0 00 00 $SPEED_HEX) ; X_SENDHEX_SETFANSPEED=$?
 		# The reply should be "01" for success.
 		echodebug "${FUNCNAME[0]}: f_sendhex exit code \"$X_SENDHEX_SETFANSPEED\"."
-		[[ "$X_SENDHEX_SETFANSPEED" -ne 0 ]] && return $? # Stop here if f_sendhex failed.
 		#
 		# Validate the reply.
-		if ( echo "$SET_FAN_SPEED_REPLY" | egrep "^01$" &> /dev/null ) ; then
+		if [[ "$SET_FAN_SPEED_REPLY" == 01 ]] ; then
 			echo "Fan $EACH successfully set to ${SET_FAN_SPEED}% speed."
 		elif [[ -z "$SET_FAN_SPEED_REPLY" ]] ; then
+			SEEN_ERROR=2
 			echoerr "ERROR: Failed to set fan \"$EACH\" to \"${SET_FAN_SPEED}%\" speed. Controller did not reply."
-			SEEN_ERROR=2
 		else
-			echoerr "ERROR: Failed to set fan \"$EACH\" to \"${SET_FAN_SPEED}%\" speed. Controller reply was invalid: \"$SHOW_FAN_REPLY\"."
 			SEEN_ERROR=2
+			echoerr "ERROR: Failed to set fan \"$EACH\" to \"${SET_FAN_SPEED}%\" speed. Controller reply was invalid: \"$SHOW_FAN_REPLY\"."
 		fi
 	done ; unset EACH
 	#
@@ -427,6 +446,9 @@ f_set_fan_speed() {
 }
 
 #--
+
+# We need to clean up hexdump and any other background processes on kill.
+trap "kill -- -$$" SIGHUP SIGQUIT SIGABRT SIGTERM SIGINT
 
 # No input? Print usage and exit 1.
 [[ "$#" -eq 0 ]] && { f_printusage ; exit 1 ; }
